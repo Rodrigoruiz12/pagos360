@@ -1,0 +1,77 @@
+server:
+  port: ${SERVER_PORT:8088}
+
+spring:
+  application:
+    name: ms-pagos
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://aws-1-us-west-2.pooler.supabase.com:5432/postgres?sslmode=require}
+    username: ${DB_USERNAME:postgres.luuftourpykupsbzusti}
+    password: ${DB_PASSWORD:yIhXrNMuw2LEISsy}
+    hikari:
+      maximum-pool-size: 3
+      minimum-idle: 1
+      idle-timeout: 30000
+      max-lifetime: 60000
+      connection-timeout: 20000
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        max.block.ms: 3000
+        request.timeout.ms: 3000
+        delivery.timeout.ms: 4000
+  cloud:
+    azure:
+      active-directory:
+        enabled: false
+
+# Configuración de Negocio (Antifraude, Webpay Plus Integración y Kafka)
+app:
+  antifraud:
+    max-attempts: ${ANTIFRAUD_MAX_ATTEMPTS:3}
+    window-seconds: ${ANTIFRAUD_WINDOW_SECONDS:10}
+  kafka:
+    enabled: ${KAFKA_ENABLED:true}
+    topic-pagos-alertas: ${KAFKA_TOPIC_PAGOS_ALERTAS:pagos.alertas}
+  webpay:
+    api-url: ${WEBPAY_API_URL:https://webpay3gint.transbank.cl/rswebpaytransaction/api/webpay/v1.2/transactions}
+    commerce-code: ${WEBPAY_COMMERCE_CODE:597055555532}
+    api-key: ${WEBPAY_API_KEY:579B532A7440BB0C9079DED94D31EA1615BACEB56610332264630D42D0A36B1C}
+    default-return-url: ${WEBPAY_RETURN_URL:https://jfgd1pckb9.execute-api.us-east-1.amazonaws.com}
+  security:
+    jwt:
+      providers:
+        # Accesos Azure Entra ID
+        - name: azure
+          jwk-set-uri: https://login.microsoftonline.com/dd140621-3398-4bfe-805b-9c162df51706/discovery/v2.0/keys
+          issuers:
+            - https://login.microsoftonline.com/dd140621-3398-4bfe-805b-9c162df51706/v2.0
+            - https://sts.windows.net/dd140621-3398-4bfe-805b-9c162df51706/
+          audiences:
+            - 4a72e40f-1d5a-497a-b040-d2fa5acb61fd
+            - cb8b1711-d599-4a45-94d9-9251f15db61a
+            - api://cb8b1711-d599-4a45-94d9-9251f15db61a
+
+        # Acceso AWS Cognito
+        - name: cognito
+          jwk-set-uri: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_EPwV5Yl4n/.well-known/jwks.json
+          issuers:
+            - https://cognito-idp.us-east-1.amazonaws.com/us-east-1_EPwV5Yl4n
+          audiences:
+            - 5qipn3rrr5j8uajmmsthq9i0cs
+          default-role: Usuario
+
+eureka:
+  client:
+    enabled: ${EUREKA_ENABLED:false}
+    service-url:
+      defaultZone: ${EUREKA_URL:http://52.205.162.211:8761/eureka/}
+  instance:
+    prefer-ip-address: true

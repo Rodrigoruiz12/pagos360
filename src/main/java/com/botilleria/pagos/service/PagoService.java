@@ -38,6 +38,9 @@ public class PagoService {
     @Value("${app.kafka.enabled:true}")
     private boolean kafkaEnabled;
 
+    @Value("${app.kafka.topic-pagos-eventos:pagos.eventos}")
+    private String topicPagosEventos;
+
     @Value("${app.kafka.topic-pagos-alertas:pagos.alertas}")
     private String topicPagosAlertas;
 
@@ -51,6 +54,9 @@ public class PagoService {
         if (request.getMonto() == null || request.getMonto() <= 0) {
             throw new IllegalArgumentException("El monto debe ser mayor a 0.");
         }
+        if (request.getNumeroTarjeta() == null || request.getNumeroTarjeta().isBlank()) {
+            throw new IllegalArgumentException("El numero de tarjeta es obligatorio.");
+        }
 
         String ordenId = (request.getOrdenId() != null && !request.getOrdenId().isBlank())
                 ? request.getOrdenId()
@@ -59,7 +65,8 @@ public class PagoService {
                 ? request.getUsuarioId()
                 : "anonimo";
 
-        AntifraudService.EvaluationResult eval = antifraudService.evaluarIntento(request.getNumeroTarjeta());
+        // Revision antifraude por usuarioId ANTES de cobrar
+        AntifraudService.EvaluationResult eval = antifraudService.evaluarIntentoPorUsuario(usuarioId, request.getNumeroTarjeta());
 
         Pago pago = new Pago();
         pago.setId(UUID.randomUUID().toString());
@@ -71,48 +78,18 @@ public class PagoService {
         pago.setTarjetaHash(eval.tarjetaHash());
         pago.setFechaCreacion(LocalDateTime.now());
 
-        Map<String, Object> respuesta = new LinkedHashMap<>();
-
         if (eval.fraudeDetectado()) {
-            String motivo = String.format(
-                    "BLOQUEO ANTIFRAUDE: La tarjeta %s registro %d intentos en menos de %d segundos (maximo permitido: %d).",
-                    eval.tarjetaEnmascarada(), eval.intentosEnVentana(), eval.ventanaSegundos(), eval.maxPermitidos()
-            );
-            pago.setEstado("BLOQUEADO_FRAUDE");
-            pago.setMotivoRechazo(motivo);
-            guardarPagoSeguro(pago);
-
-            AlertaFraude alerta = new AlertaFraude();
-            alerta.setId(UUID.randomUUID().toString());
-            alerta.setOrdenId(ordenId);
-            alerta.setUsuarioId(usuarioId);
-            alerta.setTarjetaEnmascarada(eval.tarjetaEnmascarada());
-            alerta.setTarjetaHash(eval.tarjetaHash());
-            alerta.setIntentosEnVentana(eval.intentosEnVentana());
-            alerta.setVentanaSegundos(eval.ventanaSegundos());
-            alerta.setSeveridad("CRITICA");
-            alerta.setMensaje(motivo);
-            alerta.setFechaDeteccion(LocalDateTime.now());
-            guardarAlertaSegura(alerta);
-
-            publicarEventoKafka("FRAUDE_BLOQUEADO", pago, alerta);
-
-            respuesta.put("aprobado", false);
-            respuesta.put("bloqueadoPorFraude", true);
-            respuesta.put("estado", "BLOQUEADO_FRAUDE");
-            respuesta.put("intentosEnVentana", eval.intentosEnVentana());
-            respuesta.put("ventanaSegundos", eval.ventanaSegundos());
-            respuesta.put("mensaje", motivo);
-            respuesta.put("pago", pago);
-            respuesta.put("alerta", alerta);
-            return respuesta;
+            return registrarBloqueoFraude(pago, eval);
         }
 
         pago.setEstado("APROBADO");
         pago.setCodigoAutorizacion("AUTH-" + UUID.randomUUID().toString().substring(0, 6).toUpperCase());
         guardarPagoSeguro(pago);
-        publicarEventoKafka("PAGO_APROBADO", pago, null);
 
+        // Resultado de pago publicado en pagos.eventos (pagos.alertas queda solo para fraude)
+        publicarEnTopico(topicPagosEventos, "PAGO_APROBADO", pago, null, eval);
+
+        Map<String, Object> respuesta = new LinkedHashMap<>();
         respuesta.put("aprobado", true);
         respuesta.put("bloqueadoPorFraude", false);
         respuesta.put("estado", "APROBADO");
@@ -133,12 +110,9 @@ public class PagoService {
         String usuarioId = (request.getUsuarioId() != null && !request.getUsuarioId().isBlank())
                 ? request.getUsuarioId()
                 : "anonimo";
-        String buyOrder = "BTL-" + System.currentTimeMillis();
-        String sessionId = "SES-" + usuarioId + "-" + UUID.randomUUID().toString().substring(0, 6);
 
-        Map<String, Object> tbkResp = webpayService.crearTransaccion(buyOrder, sessionId, request.getMonto(), request.getReturnUrl());
-        String token = String.valueOf(tbkResp.get("token"));
-        String url = String.valueOf(tbkResp.get("url"));
+        // Revision antifraude por usuarioId ANTES de iniciar cobro en Transbank
+        AntifraudService.EvaluationResult eval = antifraudService.evaluarIntentoPorUsuario(usuarioId, null);
 
         Pago pago = new Pago();
         pago.setId(UUID.randomUUID().toString());
@@ -146,23 +120,41 @@ public class PagoService {
         pago.setUsuarioId(usuarioId);
         pago.setMonto(request.getMonto());
         pago.setMetodoPago("WEBPAY");
+        pago.setTarjetaEnmascarada("WEBPAY");
+        pago.setTarjetaHash(eval.tarjetaHash());
+        pago.setFechaCreacion(LocalDateTime.now());
+
+        if (eval.fraudeDetectado()) {
+            return registrarBloqueoFraude(pago, eval);
+        }
+
+        String buyOrder = "BTL-" + System.currentTimeMillis();
+        String sessionId = "SES-" + usuarioId + "-" + UUID.randomUUID().toString().substring(0, 6);
+
+        Map<String, Object> tbkResp = webpayService.crearTransaccion(buyOrder, sessionId, request.getMonto(), request.getReturnUrl());
+        String token = String.valueOf(tbkResp.get("token"));
+        String url = String.valueOf(tbkResp.get("url"));
+
         pago.setEstado("PENDIENTE_WEBPAY");
         pago.setWebpayToken(token);
         pago.setWebpayBuyOrder(buyOrder);
-        pago.setFechaCreacion(LocalDateTime.now());
         guardarPagoSeguro(pago);
 
+        publicarEnTopico(topicPagosEventos, "WEBPAY_INICIADO", pago, null, eval);
+
         Map<String, Object> resultado = new LinkedHashMap<>();
+        resultado.put("aprobado", true);
+        resultado.put("bloqueadoPorFraude", false);
         resultado.put("pagoId", pago.getId());
         resultado.put("ordenId", ordenId);
         resultado.put("buyOrder", buyOrder);
         resultado.put("token", token);
         resultado.put("url", url);
         resultado.put("estado", "PENDIENTE_WEBPAY");
+        resultado.put("intentosEnVentana", eval.intentosEnVentana());
         return resultado;
     }
 
-    @SuppressWarnings("unchecked")
     public Map<String, Object> confirmarWebpay(String tokenWs) {
         if (tokenWs == null || tokenWs.isBlank()) {
             throw new IllegalArgumentException("El parametro token_ws es obligatorio.");
@@ -193,52 +185,37 @@ public class PagoService {
             pago.setWebpayBuyOrder(String.valueOf(tbkResp.getOrDefault("buy_order", "")));
         }
 
-        // Tambien pasamos los ultimos 4 digitos retornados por Webpay por el motor antifraude
-        AntifraudService.EvaluationResult eval = antifraudService.evaluarIntento("WEBPAY" + cardNumber);
-        pago.setTarjetaEnmascarada(eval.tarjetaEnmascarada());
-        pago.setTarjetaHash(eval.tarjetaHash());
+        String digitos = cardNumber.replaceAll("[^0-9]", "");
+        if (digitos.length() >= 4) {
+            pago.setTarjetaEnmascarada(antifraudService.enmascararTarjeta(digitos));
+            pago.setTarjetaHash(antifraudService.calcularHash(digitos));
+        }
         pago.setCodigoAutorizacion(authCode);
 
+        // Sin revision antifraude en confirmar (el fraude se valida antes del cobro en /webpay/iniciar)
         boolean aprobado = responseCode == 0 && "AUTHORIZED".equalsIgnoreCase(status);
-        if (eval.fraudeDetectado()) {
-            String motivo = "ALERTA ANTIFRAUDE WEBPAY: Tarjeta " + eval.tarjetaEnmascarada()
-                    + " supero " + eval.maxPermitidos() + " transacciones en " + eval.ventanaSegundos() + "s.";
-            pago.setEstado("BLOQUEADO_FRAUDE");
-            pago.setMotivoRechazo(motivo);
-            guardarPagoSeguro(pago);
-
-            AlertaFraude alerta = new AlertaFraude();
-            alerta.setId(UUID.randomUUID().toString());
-            alerta.setOrdenId(pago.getOrdenId());
-            alerta.setUsuarioId(pago.getUsuarioId());
-            alerta.setTarjetaEnmascarada(eval.tarjetaEnmascarada());
-            alerta.setTarjetaHash(eval.tarjetaHash());
-            alerta.setIntentosEnVentana(eval.intentosEnVentana());
-            alerta.setVentanaSegundos(eval.ventanaSegundos());
-            alerta.setSeveridad("CRITICA");
-            alerta.setMensaje(motivo);
-            alerta.setFechaDeteccion(LocalDateTime.now());
-            guardarAlertaSegura(alerta);
-            publicarEventoKafka("FRAUDE_BLOQUEADO", pago, alerta);
-            aprobado = false;
-        } else if (aprobado) {
+        if (aprobado) {
             pago.setEstado("APROBADO");
             guardarPagoSeguro(pago);
-            publicarEventoKafka("WEBPAY_APROBADO", pago, null);
+            publicarEnTopico(topicPagosEventos, "WEBPAY_APROBADO", pago, null, null);
         } else {
             pago.setEstado("RECHAZADO");
             pago.setMotivoRechazo("Transbank rechazo la transaccion (response_code=" + responseCode + ", status=" + status + ")");
             guardarPagoSeguro(pago);
-            publicarEventoKafka("WEBPAY_RECHAZADO", pago, null);
+            publicarEnTopico(topicPagosEventos, "WEBPAY_RECHAZADO", pago, null, null);
         }
 
         Map<String, Object> respuesta = new LinkedHashMap<>();
         respuesta.put("aprobado", aprobado);
-        respuesta.put("bloqueadoPorFraude", eval.fraudeDetectado());
+        respuesta.put("bloqueadoPorFraude", false);
         respuesta.put("estado", pago.getEstado());
         respuesta.put("pago", pago);
         respuesta.put("transbank", tbkResp);
         return respuesta;
+    }
+
+    public boolean desbloquearUsuario(String usuarioId) {
+        return antifraudService.desbloquearUsuario(usuarioId);
     }
 
     public List<Pago> listarPagos() {
@@ -254,6 +231,59 @@ public class PagoService {
     public List<AlertaFraude> listarAlertasFraude() {
         if (alertaFraudeRepository == null) return List.of();
         return alertaFraudeRepository.findAllByOrderByFechaDeteccionDesc();
+    }
+
+    private Map<String, Object> registrarBloqueoFraude(Pago pago, AntifraudService.EvaluationResult eval) {
+        long minBloqueo = Math.max(1L, Math.round(eval.bloqueoDuracionSegundos() / 60.0));
+        long minRest = eval.segundosRestantesBloqueo() / 60;
+        long segRest = eval.segundosRestantesBloqueo() % 60;
+        String tiempoRestanteTxt = String.format("%d min %02d s", minRest, segRest);
+
+        String motivo = eval.yaEstabaBloqueado()
+                ? String.format(
+                        "BLOQUEO ANTIFRAUDE ACTIVO (%s): El usuario '%s' permanece bloqueado por seguridad. Podra reintentar en %s.",
+                        pago.getMetodoPago(), pago.getUsuarioId(), tiempoRestanteTxt)
+                : String.format(
+                        "BLOQUEO ANTIFRAUDE (%s): El usuario '%s' registro %d intentos en menos de %d segundos (maximo permitido: %d). Cuenta bloqueada preventivamente por %d minutos.",
+                        pago.getMetodoPago(), pago.getUsuarioId(), eval.intentosEnVentana(),
+                        eval.ventanaSegundos(), eval.maxPermitidos(), minBloqueo);
+
+        pago.setEstado("BLOQUEADO_FRAUDE");
+        pago.setMotivoRechazo(motivo);
+        guardarPagoSeguro(pago);
+
+        AlertaFraude alerta = new AlertaFraude();
+        alerta.setId(UUID.randomUUID().toString());
+        alerta.setOrdenId(pago.getOrdenId());
+        alerta.setUsuarioId(pago.getUsuarioId());
+        alerta.setTarjetaEnmascarada(pago.getTarjetaEnmascarada());
+        alerta.setTarjetaHash(pago.getTarjetaHash());
+        alerta.setIntentosEnVentana(eval.intentosEnVentana());
+        alerta.setVentanaSegundos(eval.ventanaSegundos());
+        alerta.setSeveridad("CRITICA");
+        alerta.setMensaje(motivo);
+        alerta.setFechaDeteccion(LocalDateTime.now());
+        guardarAlertaSegura(alerta);
+
+        // Fraude se publica tanto en pagos.alertas (exclusivo alertas) como en pagos.eventos (todos los resultados)
+        publicarEnTopico(topicPagosAlertas, "FRAUDE_BLOQUEADO", pago, alerta, eval);
+        publicarEnTopico(topicPagosEventos, "FRAUDE_BLOQUEADO", pago, alerta, eval);
+
+        Map<String, Object> respuesta = new LinkedHashMap<>();
+        respuesta.put("aprobado", false);
+        respuesta.put("bloqueadoPorFraude", true);
+        respuesta.put("estado", "BLOQUEADO_FRAUDE");
+        respuesta.put("metodoPago", pago.getMetodoPago());
+        respuesta.put("usuarioId", pago.getUsuarioId());
+        respuesta.put("intentosEnVentana", eval.intentosEnVentana());
+        respuesta.put("ventanaSegundos", eval.ventanaSegundos());
+        respuesta.put("bloqueoMinutos", minBloqueo);
+        respuesta.put("segundosRestantesBloqueo", eval.segundosRestantesBloqueo());
+        respuesta.put("bloqueadoHasta", eval.bloqueadoHasta() != null ? eval.bloqueadoHasta().toString() : null);
+        respuesta.put("mensaje", motivo);
+        respuesta.put("pago", pago);
+        respuesta.put("alerta", alerta);
+        return respuesta;
     }
 
     private void guardarPagoSeguro(Pago pago) {
@@ -276,7 +306,12 @@ public class PagoService {
         }
     }
 
-    private void publicarEventoKafka(String tipoEvento, Pago pago, AlertaFraude alerta) {
+    private void publicarEnTopico(
+            String topico,
+            String tipoEvento,
+            Pago pago,
+            AlertaFraude alerta,
+            AntifraudService.EvaluationResult eval) {
         if (!kafkaEnabled || kafkaTemplate == null) {
             return;
         }
@@ -296,10 +331,14 @@ public class PagoService {
                 payload.put("intentosEnVentana", alerta.getIntentosEnVentana());
                 payload.put("severidad", alerta.getSeveridad());
             }
+            if (eval != null && eval.bloqueadoHasta() != null) {
+                payload.put("segundosRestantesBloqueo", eval.segundosRestantesBloqueo());
+                payload.put("bloqueadoHasta", eval.bloqueadoHasta().toString());
+            }
             String json = objectMapper.writeValueAsString(payload);
-            kafkaTemplate.send(topicPagosAlertas, pago.getOrdenId(), json);
+            kafkaTemplate.send(topico, pago.getUsuarioId(), json);
         } catch (Exception e) {
-            System.err.println("[ms-pagos] Aviso Kafka (no bloqueante): " + e.getMessage());
+            System.err.println("[ms-pagos] Aviso Kafka en " + topico + " (no bloqueante): " + e.getMessage());
         }
     }
 }

@@ -45,8 +45,10 @@ app:
   antifraud:
     max-attempts: ${ANTIFRAUD_MAX_ATTEMPTS:3}
     window-seconds: ${ANTIFRAUD_WINDOW_SECONDS:10}
+    block-duration-seconds: ${ANTIFRAUD_BLOCK_SECONDS:300}
   kafka:
     enabled: ${KAFKA_ENABLED:true}
+    topic-pagos-eventos: ${KAFKA_TOPIC_PAGOS_EVENTOS:pagos.eventos}
     topic-pagos-alertas: ${KAFKA_TOPIC_PAGOS_ALERTAS:pagos.alertas}
     topic-ordenes: ${KAFKA_TOPIC_ORDENES:ordenes.eventos}
   webpay:

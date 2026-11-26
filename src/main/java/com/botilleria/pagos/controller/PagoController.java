@@ -29,7 +29,8 @@ public class PagoController {
                 "servicio", "ms-pagos",
                 "estado", "UP",
                 "webpay", "Integracion Transbank v1.2",
-                "antifraude", "Max 3 intentos cada 10 segundos por tarjeta",
+                "antifraude", "Max 3 intentos cada 10s por usuarioId (bloqueo preventivo 5 minutos)",
+                "topicosKafka", List.of("pagos.eventos", "pagos.alertas"),
                 "timestamp", Instant.now().toString()
         );
     }
@@ -46,18 +47,18 @@ public class PagoController {
 
     @PostMapping("/webpay/iniciar")
     public ResponseEntity<Map<String, Object>> iniciarWebpay(@RequestBody WebpayInitRequest request) {
-        return ResponseEntity.ok(pagoService.iniciarWebpay(request));
-    }
-
-    @PostMapping("/webpay/confirmar")
-    public ResponseEntity<Map<String, Object>> confirmarWebpay(@RequestBody Map<String, String> body) {
-        String tokenWs = body.getOrDefault("token_ws", body.get("token"));
-        Map<String, Object> resultado = pagoService.confirmarWebpay(tokenWs);
+        Map<String, Object> resultado = pagoService.iniciarWebpay(request);
         boolean bloqueado = Boolean.TRUE.equals(resultado.get("bloqueadoPorFraude"));
         if (bloqueado) {
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(resultado);
         }
         return ResponseEntity.ok(resultado);
+    }
+
+    @PostMapping("/webpay/confirmar")
+    public ResponseEntity<Map<String, Object>> confirmarWebpay(@RequestBody Map<String, String> body) {
+        String tokenWs = body.getOrDefault("token_ws", body.get("token"));
+        return ResponseEntity.ok(pagoService.confirmarWebpay(tokenWs));
     }
 
     @GetMapping("/webpay/retorno")
@@ -69,6 +70,16 @@ public class PagoController {
             ));
         }
         return ResponseEntity.ok(pagoService.confirmarWebpay(tokenWs));
+    }
+
+    @DeleteMapping("/antifraude/{usuarioId}")
+    public ResponseEntity<Map<String, Object>> desbloquearUsuario(@PathVariable String usuarioId) {
+        boolean estabaBloqueado = pagoService.desbloquearUsuario(usuarioId);
+        return ResponseEntity.ok(Map.of(
+                "usuarioId", usuarioId,
+                "desbloqueado", true,
+                "teniaBloqueoActivo", estabaBloqueado
+        ));
     }
 
     @GetMapping
